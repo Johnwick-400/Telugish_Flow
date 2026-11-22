@@ -186,7 +186,7 @@ struct DictationDashboard: View {
     private var history: some View {
         VStack(alignment: .leading, spacing: 14) {
             if state.entries.isEmpty {
-                Text("No Saaras recordings yet. Your latest Saaras results will appear here.")
+                Text("Your offline dictations will appear here.")
                     .foregroundStyle(muted)
             }
             ForEach(state.entries, id: \.id) { entry in
@@ -201,7 +201,7 @@ struct DictationDashboard: View {
                         if let output = entry.output { Button("Copy result") { copy(output) } }
                         if let raw = entry.raw { Button("Copy raw") { copy(raw) } }
                         if entry.output != entry.raw, entry.raw != nil { Button("Undo cleanup") { undo(entry) } }
-                        if state.retryable.contains(entry.id) { Button("Retry with Saaras") { retry(entry) } }
+                        if state.retryable.contains(entry.id) { Button("Retry offline") { retry(entry) } }
                     }
                 }
                 .padding(15)

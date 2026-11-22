@@ -22,26 +22,20 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
     private let noiseItem = NSMenuItem(title: "Offline Noise Filter", action: nil, keyEquivalent: "")
     private var target: NSRunningApplication?
     private var cloudKey: String?
-    private var saarasKeys: (sarvam: String, openAI: String?)?
-    private var saarasFile: URL?
-    private var saarasFileIsTemporary = true
-    private let saarasMode = NSMenuItem(title: "Use Sarvam / Compare…", action: nil, keyEquivalent: "")
-    private var comparisonPanel: NSPanel?
-    private var comparisonText: NSTextView?
-    private var comparisonCount = 0
+    private var retryEntry: HistoryEntry?
     private let history = DictationHistory()
     private let dashboardState = DashboardState()
     private let accountState = AccountState()
     private var dashboardWindow: NSWindow?
     private let historyItem = NSMenuItem(title: "Dictation History", action: nil, keyEquivalent: "")
-    private var keepHistoryAudio = UserDefaults.standard.object(forKey: "keepHistoryAudio") as? Bool ?? true
+    private var keepHistoryAudio = UserDefaults.standard.object(forKey: "keepHistoryAudio") as? Bool ?? false
     private var testPasteTimer: Timer?
     private var smartEnabled = UserDefaults.standard.object(forKey: "smartDictation") as? Bool ?? true
     private var lastRawTranscript: String?
     private let cleanupMode = NSMenuItem(title: "Dictation Output", action: nil, keyEquivalent: "")
     private let copyRawItem = NSMenuItem(title: "Copy Raw Transcript", action: nil, keyEquivalent: "")
     private var dictionary: [String] {
-        UserDefaults.standard.stringArray(forKey: "sarvamDictionary") ??
+        UserDefaults.standard.stringArray(forKey: "personalDictionary") ??
             ["Naveen", "Hyderabad", "WhatsApp", "HDFC", "home loan", "EMI",
              "GitHub", "pull request", "backend API logs", "AWS", "Slack"]
     }
@@ -65,9 +59,6 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
         cloudMode.action = #selector(toggleCloud)
         cloudMode.target = self
         menu.addItem(cloudMode)
-        saarasMode.action = #selector(toggleSaaras)
-        saarasMode.target = self
-        menu.addItem(saarasMode)
         let outputMenu = NSMenu()
         for (title, tag) in [("Raw", 0), ("Smart", 1)] {
             let option = outputMenu.addItem(withTitle: title, action: #selector(setCleanupMode(_:)), keyEquivalent: "")
@@ -85,8 +76,6 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
         dictionaryItem.target = self
         copyRawItem.target = self
         menu.addItem(copyRawItem)
-        let results = menu.addItem(withTitle: "Show Comparison Results", action: #selector(showComparison), keyEquivalent: "")
-        results.target = self
         menu.addItem(historyItem)
         refreshHistoryMenu()
         let diagnostics = menu.addItem(withTitle: "Auto-Paste Diagnostics…", action: #selector(pasteDiagnostics), keyEquivalent: "")
@@ -111,15 +100,6 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
         NSLog("Auto-paste permission · Accessibility: %@ · Post Events: %@",
               AXIsProcessTrusted() ? "granted" : "required", CGPreflightPostEventAccess() ? "granted" : "required")
         startWorker()
-        if CommandLine.arguments.contains("--comparison-keys-stdin"),
-           let sarvam = readLine(), let openAI = readLine(),
-           !sarvam.isEmpty, openAI.hasPrefix("sk-") {
-            enableSaaras(sarvam: sarvam, openAI: openAI)
-            showComparison()
-        } else if CommandLine.arguments.contains("--sarvam-key-stdin"),
-                  let sarvam = readLine(), !sarvam.isEmpty {
-            enableSaaras(sarvam: sarvam, openAI: nil)
-        }
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -163,16 +143,12 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
     }
 
     private func refreshDashboard() {
-        if let keys = saarasKeys {
-            dashboardState.engine = keys.openAI == nil ? "Saaras v4 · Romanized Telugish" : "Sarvam + OpenAI comparison"
-        } else {
             dashboardState.engine = cloudKey == nil ? "OpenFlow · Offline" : "OpenAI Realtime"
-        }
         dashboardState.english = englishOutput
         if englishOutput { dashboardState.engine = "Whisper Small · Offline translation" }
         dashboardState.status = status.title
         dashboardState.smart = smartEnabled
-        dashboardState.offline = englishOutput || (cloudKey == nil && saarasKeys == nil)
+        dashboardState.offline = englishOutput || (cloudKey == nil)
         dashboardState.noiseReduction = noiseReduction
         dashboardState.pasteAllowed = AXIsProcessTrusted() || CGPreflightPostEventAccess()
         dashboardState.entries = history.entries
@@ -187,15 +163,11 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
         alert.informativeText = "Choose which engine receives your dictation."
         alert.addButton(withTitle: "Keep current")
         alert.addButton(withTitle: "Offline OpenFlow")
-        alert.addButton(withTitle: "Saaras / Compare…")
         alert.addButton(withTitle: "OpenAI Realtime…")
         switch alert.runModal().rawValue {
         case NSApplication.ModalResponse.alertSecondButtonReturn.rawValue:
-            if saarasKeys != nil { toggleSaaras() }
             if cloudKey != nil { toggleCloud() }
         case NSApplication.ModalResponse.alertThirdButtonReturn.rawValue:
-            if saarasKeys == nil { toggleSaaras() }
-        case NSApplication.ModalResponse.alertThirdButtonReturn.rawValue + 1:
             if cloudKey == nil { toggleCloud() }
         default: break
         }
@@ -218,12 +190,12 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
                 actions.addItem(withTitle: failure, action: nil, keyEquivalent: "")
             }
             if history.audio(for: entry.id) != nil {
-                addHistoryAction("Retry with Saaras", action: #selector(retryHistory(_:)), id: entry.id, to: actions)
+                addHistoryAction("Retry offline", action: #selector(retryHistory(_:)), id: entry.id, to: actions)
             }
             item.submenu = actions
         }
         if history.entries.isEmpty {
-            menu.addItem(withTitle: "No Saaras dictations yet", action: nil, keyEquivalent: "")
+            menu.addItem(withTitle: "No dictations yet", action: nil, keyEquivalent: "")
         }
         menu.addItem(.separator())
         let audio = menu.addItem(withTitle: "Keep Audio for Retry", action: #selector(toggleHistoryAudio), keyEquivalent: "")
@@ -284,13 +256,12 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
     }
 
     private func retry(entry: HistoryEntry) {
-        guard !busy, let audio = history.audio(for: entry.id) else { return }
-        guard let key = saarasKeys?.sarvam else {
-            show("Enable Saaras to retry")
-            return
-        }
-        // Retry updates the saved item and leaves the current editor alone.
-        transcribeSaaras(url: audio, keys: (key, nil), retry: entry)
+        guard !busy, ready, let audio = history.audio(for: entry.id) else { return }
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".wav")
+        do { try FileManager.default.copyItem(at: audio, to: temp) }
+        catch { show("Could not open saved audio"); return }
+        retryEntry = entry
+        submitRecording(temp)
     }
 
     @objc private func toggleHistoryAudio() {
@@ -383,7 +354,7 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
         dashboardState.smart = enabled
         UserDefaults.standard.set(smartEnabled, forKey: "smartDictation")
         updateCleanupMenu()
-        if ready && !busy && cloudKey == nil && saarasKeys == nil {
+        if ready && !busy && cloudKey == nil {
             show(smartEnabled ? "Ready · Offline Smart" : "Ready · Offline Raw")
         }
     }
@@ -420,7 +391,7 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
         NSApplication.shared.activate(ignoringOtherApps: true)
         let dialog = NSAlert()
         dialog.messageText = "Personal Dictionary"
-        dialog.informativeText = "One name or phrase per line. Up to 50 terms of 64 characters each are used as recognition hints. Offline OpenFlow uses them locally. Saaras mode sends them to Sarvam."
+        dialog.informativeText = "One name or phrase per line. Up to 50 terms of 64 characters each are used as recognition hints. Offline OpenFlow uses them locally."
         let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 360, height: 180))
         scroll.hasVerticalScroller = true
         let text = NSTextView(frame: scroll.bounds)
@@ -439,97 +410,15 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty && seen.insert($0.lowercased()).inserted }
         guard terms.count <= 50, terms.allSatisfy({ $0.unicodeScalars.count <= 64 }) else {
-            show("Dictionary exceeds Sarvam’s term limits")
+            show("Use up to 50 terms of 64 characters each")
             return
         }
-        UserDefaults.standard.set(terms, forKey: "sarvamDictionary")
+        UserDefaults.standard.set(terms, forKey: "personalDictionary")
         show("Saved \(terms.count) dictionary terms")
     }
 
     private var busy: Bool {
-        recorder != nil || pendingURL != nil || cloudTurn != nil || saarasFile != nil
-    }
-
-    @objc private func toggleSaaras() {
-        guard !busy else { return }
-        if saarasKeys != nil {
-            saarasKeys = nil
-            saarasMode.title = "Use Sarvam / Compare…"
-            saarasMode.state = .off
-            show(ready ? "Ready · Offline" : "Offline engine unavailable")
-            return
-        }
-        NSApplication.shared.activate(ignoringOtherApps: true)
-        let dialog = NSAlert()
-        dialog.messageText = "Use Saaras v4"
-        dialog.informativeText = "Each recording goes to Sarvam. Add an OpenAI key to send the same recording to OpenAI and show both results. Keys stay in memory for this session."
-        let inputs = NSStackView(frame: NSRect(x: 0, y: 0, width: 320, height: 60))
-        inputs.orientation = .vertical
-        inputs.alignment = .leading
-        let sarvam = NSSecureTextField()
-        sarvam.placeholderString = "Sarvam API key"
-        let openAI = NSSecureTextField()
-        openAI.placeholderString = "OpenAI API key (for comparison)"
-        for field in [sarvam, openAI] {
-            inputs.addArrangedSubview(field)
-            field.widthAnchor.constraint(equalToConstant: 320).isActive = true
-        }
-        dialog.accessoryView = inputs
-        dialog.window.initialFirstResponder = sarvam
-        dialog.addButton(withTitle: "Enable")
-        dialog.addButton(withTitle: "Cancel")
-        guard dialog.runModal() == .alertFirstButtonReturn else { return }
-        let key = sarvam.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let comparisonKey = openAI.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty, key.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
-              comparisonKey.isEmpty || (comparisonKey.hasPrefix("sk-") &&
-                                           comparisonKey.rangeOfCharacter(from: .whitespacesAndNewlines) == nil) else {
-            show("Check the API keys")
-            return
-        }
-        enableSaaras(sarvam: key, openAI: comparisonKey.isEmpty ? nil : comparisonKey)
-    }
-
-    private func enableSaaras(sarvam: String, openAI: String?) {
-        cloudKey = nil
-        cloudMode.title = "Use OpenAI Realtime…"
-        cloudMode.state = .off
-        saarasKeys = (sarvam, openAI)
-        saarasMode.title = "Switch Sarvam to Offline"
-        saarasMode.state = .on
-        comparisonCount = 0
-        comparisonText?.string = ""
-        show(openAI == nil ? "Ready · Saaras v4" : "Ready · Sarvam + OpenAI comparison")
-        if openAI != nil { NSLog("Sarvam and OpenAI comparison enabled") }
-        else { NSLog("Saaras v4 enabled · %@", smartEnabled ? "Smart" : "Raw") }
-    }
-
-    @objc private func showComparison() {
-        if comparisonPanel == nil {
-            let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 720, height: 480),
-                                styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
-                                backing: .buffered, defer: false)
-            panel.title = "Sarvam and OpenAI Comparison"
-            panel.isReleasedWhenClosed = false
-            panel.hidesOnDeactivate = false
-            panel.center()
-            let scroll = NSScrollView(frame: panel.contentView!.bounds)
-            scroll.hasVerticalScroller = true
-            scroll.autoresizingMask = [.width, .height]
-            let text = NSTextView(frame: scroll.bounds)
-            text.isEditable = false
-            text.isSelectable = true
-            text.isVerticallyResizable = true
-            text.textContainer?.widthTracksTextView = true
-            text.autoresizingMask = [.width]
-            text.font = .systemFont(ofSize: 15)
-            text.textContainerInset = NSSize(width: 14, height: 14)
-            scroll.documentView = text
-            panel.contentView?.addSubview(scroll)
-            comparisonPanel = panel
-            comparisonText = text
-        }
-        comparisonPanel?.orderFrontRegardless()
+        recorder != nil || pendingURL != nil || cloudTurn != nil
     }
 
     @objc private func toggleCloud() {
@@ -557,9 +446,6 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
             show("Enter a valid OpenAI API key")
             return
         }
-        saarasKeys = nil
-        saarasMode.title = "Use Sarvam / Compare…"
-        saarasMode.state = .off
         cloudKey = key
         cloudMode.state = .on
         cloudMode.title = "Switch to Offline"
@@ -604,11 +490,9 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
             show("App resources missing")
             return
         }
-        let pathFile = resources.appendingPathComponent("python-path.txt")
-        guard let path = try? String(contentsOf: pathFile, encoding: .utf8)
-                .trimmingCharacters(in: .newlines),
-              FileManager.default.isExecutableFile(atPath: path) else {
-            show("Python 3.12 missing · Rebuild app")
+        let path = resources.appendingPathComponent("runtime/bin/python3.12").path
+        guard FileManager.default.isExecutableFile(atPath: path) else {
+            show("Bundled Python runtime missing")
             return
         }
         let process = Process()
@@ -652,14 +536,14 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
             guard let message = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else { continue }
             if message["ready"] as? Bool == true {
                 ready = true
-                if cloudKey == nil && saarasKeys == nil {
+                if cloudKey == nil {
                     show(smartEnabled ? "Ready · Offline Smart" : "Ready · Offline Raw")
                     NSLog("Offline dictation output: %@ · Noise filter: %@",
                           smartEnabled ? "Smart" : "Raw", noiseReduction ? "On" : "Off")
                 }
                 NSLog("Offline Telugish engine ready")
             } else if let url = pendingURL {
-                try? FileManager.default.removeItem(at: url)
+                defer { try? FileManager.default.removeItem(at: url); retryEntry = nil }
                 pendingURL = nil
                 defer { target = nil }
                 if let error = message["error"] as? String {
@@ -667,7 +551,15 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
                     show("Transcription failed")
                 } else if let text = message["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     rememberRawTranscript(text)
-                    paste(pendingOfflineSmart ? SmartDictation.clean(text) : text)
+                    let result = pendingOfflineSmart ? SmartDictation.clean(text) : text
+                    let entry = HistoryEntry(id: retryEntry?.id ?? UUID(), date: retryEntry?.date ?? Date(),
+                                             raw: text, output: result, failure: nil)
+                    do {
+                        try history.save(entry, recording: keepHistoryAudio && retryEntry == nil ? url : nil)
+                        refreshHistoryMenu()
+                    } catch { NSLog("History save failed") }
+                    if retryEntry == nil { paste(result) }
+                    else { show("Retry saved to history") }
                 } else {
                     show("No speech detected")
                 }
@@ -677,7 +569,7 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
 
     private func beginRecording() {
         guard !busy else { return }
-        guard ready || (!englishOutput && (cloudKey != nil || saarasKeys != nil)) else { show("Offline engine unavailable"); return }
+        guard ready || (!englishOutput && (cloudKey != nil)) else { show("Offline engine unavailable"); return }
         guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
             show("Microphone permission required")
             setUpPermissions()
@@ -703,10 +595,10 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
             recorder = newRecorder
             recordingURL = url
             target = NSWorkspace.shared.frontmostApplication
-            recordingTimeout = Timer.scheduledTimer(withTimeInterval: englishOutput || saarasKeys == nil ? 120 : 29, repeats: false) { [weak self] _ in
+            recordingTimeout = Timer.scheduledTimer(withTimeInterval: 120, repeats: false) { [weak self] _ in
                 self?.endRecording()
             }
-            show(englishOutput || saarasKeys == nil ? "Recording…" : "Recording for Sarvam…", icon: "mic.fill")
+            show("Recording…", icon: "mic.fill")
         } catch {
             try? FileManager.default.removeItem(at: url)
             NSLog("Microphone failed: %@", error.localizedDescription)
@@ -780,16 +672,17 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
         recordingURL = nil
         recordingTimeout?.invalidate()
         recordingTimeout = nil
-        if flag, !englishOutput, let keys = saarasKeys {
-            transcribeSaaras(url: url, keys: keys)
-            return
-        }
-        guard flag, ready, let input else {
+        guard flag, ready, input != nil else {
             try? FileManager.default.removeItem(at: url)
             target = nil
             show("Recording unavailable")
             return
         }
+        submitRecording(url)
+    }
+
+    private func submitRecording(_ url: URL) {
+        guard let input else { try? FileManager.default.removeItem(at: url); retryEntry = nil; return }
         do {
             var request = try JSONSerialization.data(withJSONObject: ["path": url.path, "keyterms": dictionary, "noise_reduction": noiseReduction, "output_language": englishOutput ? "english" : "telugish"])
             request.append(10)
@@ -802,84 +695,6 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
         }
     }
 
-    private func transcribeSaaras(url: URL, keys: (sarvam: String, openAI: String?), retry: HistoryEntry? = nil) {
-        saarasFile = url
-        saarasFileIsTemporary = retry == nil
-        let hints = dictionary
-        let useSmart = smartEnabled
-        show(keys.openAI == nil ? "Transcribing with Sarvam…" : "Comparing both transcripts…", icon: "waveform")
-        Task { @MainActor in
-            async let sarvam = Self.transcript {
-                try await Saaras.transcribe(wav: Data(contentsOf: url), key: keys.sarvam, keyterms: hints)
-            }
-            async let openAI = Self.transcript {
-                guard let key = keys.openAI else { return "" }
-                return try await CloudDictation.transcribeRecording(at: url, key: key)
-            }
-            let results = await (sarvam, openAI)
-            let raw = results.0.text.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
-            let cleaned = raw.map { useSmart ? SmartDictation.clean($0) : $0 }
-            let entry = HistoryEntry(id: retry?.id ?? UUID(), date: retry?.date ?? Date(),
-                                     raw: raw ?? retry?.raw, output: cleaned ?? retry?.output,
-                                     failure: raw == nil ? results.0.display : nil)
-            var historySaved = true
-            do {
-                try history.save(entry, recording: retry == nil && keepHistoryAudio ? url : nil)
-                refreshHistoryMenu()
-            } catch {
-                historySaved = false
-                NSLog("Could not save local dictation history")
-            }
-            if retry == nil { try? FileManager.default.removeItem(at: url) }
-            saarasFile = nil
-            defer { target = nil }
-            if let raw = results.0.text, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                rememberRawTranscript(raw)
-            }
-            if retry != nil {
-                if let cleaned {
-                    copyHistoryText(cleaned, status: historySaved ? "Retry complete · Result copied" : "Retry copied · History could not save")
-                } else {
-                    show("Retry failed · \(results.0.display)")
-                }
-                return
-            }
-            if keys.openAI != nil {
-                showComparison()
-                comparisonCount += 1
-                comparisonText?.string += [
-                    "Recording \(comparisonCount)",
-                    "Sarvam Saaras v4 · Romanized",
-                    results.0.display,
-                    "",
-                    "OpenAI Realtime",
-                    results.1.display,
-                    "",
-                    ""
-                ].joined(separator: "\n")
-                if let text = comparisonText {
-                    text.scrollRangeToVisible(NSRange(location: (text.string as NSString).length, length: 0))
-                }
-                show("Ready · Comparison \(comparisonCount) saved in window")
-            } else if let cleaned {
-                paste(cleaned)
-            } else {
-                show("Sarvam · \(results.0.display)")
-            }
-        }
-    }
-
-    private static func transcript(_ operation: () async throws -> String) async -> (text: String?, display: String) {
-        do {
-            let text = try await operation()
-            return (text, text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "No text returned" : text)
-        } catch let error as RecordedTranscriptionError {
-            return (nil, error.localizedDescription)
-        } catch {
-            // Avoid logging credential-bearing request details or audio.
-            return (nil, "Request failed. Check the key and connection.")
-        }
-    }
 
     private func paste(_ text: String) {
         paste(text, to: target)
@@ -971,10 +786,11 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
 
     private func workerStopped() {
         ready = false
+        retryEntry = nil
         if let pendingURL { try? FileManager.default.removeItem(at: pendingURL) }
         pendingURL = nil
         if recorder != nil { endRecording() }
-        if cloudKey == nil && saarasKeys == nil { show("Offline engine stopped · Relaunch app") }
+        if cloudKey == nil { show("Offline engine stopped · Relaunch app") }
     }
 
     private func show(_ title: String, icon: String = "mic") {
@@ -995,7 +811,7 @@ final class Dictation: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
         activeRecorder?.stop()
         output?.readabilityHandler = nil
         if let worker, worker.isRunning { worker.terminate() }
-        for url in [recordingURL, pendingURL, saarasFileIsTemporary ? saarasFile : nil].compactMap({ $0 }) {
+        for url in [recordingURL, pendingURL].compactMap({ $0 }) {
             try? FileManager.default.removeItem(at: url)
         }
     }
