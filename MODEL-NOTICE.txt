@@ -1,0 +1,5 @@
+OpenFlow-Telugish Small INT8 by Parasuram Pavan Teja Veesam
+https://huggingface.co/Johnwick0007/openflow-telugish
+Revision: f9e7fca1d6983d7d5f62d18170bb7bd8be0c83a5
+Model license listed by publisher: Apache-2.0
+Checkpoint files are distributed as published.

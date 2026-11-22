@@ -1,0 +1,11 @@
+.DS_Store
+*.app/
+.telugish-build.*/
+.env
+.env.*
+.venv/
+__pycache__/
+.account-env/
+*.pem
+*.p12
+*.pyc
